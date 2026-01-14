@@ -84,17 +84,26 @@ It will be used when:
 
 Thanos supports exporting traces in the OpenTelemetry Protocol (OTLP). Both gRPC and HTTP clients are supported. Options can be provided also via environment variables. For more details see the [exporter specification](https://github.com/open-telemetry/opentelemetry-specification/blob/main/specification/protocol/exporter.md#configuration-options).
 
+Most settings are optional.
+
 ```yaml mdox-exec="go run scripts/cfggen/main.go --name=otlp.Config"
 type: OTLP
 config:
+  # Required: "grpc" or "http"
   client_type: ""
+  # endpoint address and port to connect to
+  # default localhost:4317 for grpc, localhost:4317 for http
+  endpoint: ""
+  # Override URL path on endpoint to use (http only); default "/v1/traces"
+  url_path: ""
+  # service.name attribute to send (like OTEL_SERVICE_NAME env-var)
   service_name: ""
+  # resource attributes to send (like OTEL_RESOURCE_ATTRIBUTES env-var)
   resource_attributes: {}
+  # Whether non-TLS connections are permitted
+  insecure: false
   reconnection_period: 0s
   compression: ""
-  insecure: false
-  endpoint: ""
-  url_path: ""
   timeout: 0s
   retry_config:
     retry_enabled: false
@@ -113,6 +122,8 @@ config:
 ```
 
 ### Jaeger
+
+**Deprecated**: Jaeger accepts traces in OTLP format, so the [OpenTelemetry (OTLP)](#opentelemetry-otlp) exporter should be preferred.
 
 Client for https://github.com/jaegertracing/jaeger tracing. Options can be provided also via environment variables. For more details see the Jaeger [exporter specification](https://github.com/open-telemetry/opentelemetry-specification/blob/main/specification/configuration/sdk-environment-variables.md#jaeger-exporter).
 
