@@ -26,6 +26,7 @@ import (
 type TracingProvider string
 
 const (
+	Noop                  TracingProvider = "NOOP"
 	Stackdriver           TracingProvider = "STACKDRIVER"
 	GoogleCloud           TracingProvider = "GOOGLE_CLOUD"
 	Jaeger                TracingProvider = "JAEGER"
@@ -43,6 +44,10 @@ func NewTracer(ctx context.Context, logger log.Logger, metrics *prometheus.Regis
 	level.Info(logger).Log("msg", "loading tracing configuration")
 	tracingConf := &TracingConfig{}
 
+	if len(confContentYaml) == 0 {
+		return NoopTracer(), nil, nil
+	}
+
 	if err := yaml.UnmarshalStrict(confContentYaml, tracingConf); err != nil {
 		return nil, nil, errors.Wrap(err, "parsing config tracing YAML")
 	}
@@ -57,6 +62,8 @@ func NewTracer(ctx context.Context, logger log.Logger, metrics *prometheus.Regis
 	}
 
 	switch strings.ToUpper(string(tracingConf.Type)) {
+	case string(Noop):
+		return NoopTracer(), nil, nil
 	case string(Stackdriver), string(GoogleCloud):
 		tracerProvider, err := google_cloud.NewTracerProvider(ctx, logger, config)
 		if err != nil {

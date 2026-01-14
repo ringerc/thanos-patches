@@ -115,14 +115,10 @@ func main() {
 			os.Exit(1)
 		}
 
-		if len(confContentYaml) == 0 {
-			tracer = client.NoopTracer()
-		} else {
-			tracer, closer, err = client.NewTracer(ctx, logger, metrics, confContentYaml)
-			if err != nil {
-				fmt.Fprintln(os.Stderr, errors.Wrapf(err, "tracing failed"))
-				os.Exit(1)
-			}
+		tracer, closer, err = client.NewTracer(ctx, logger, metrics, confContentYaml)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, errors.Wrapf(err, "tracing failed"))
+			os.Exit(1)
 		}
 
 		// This is bad, but Prometheus does not support any other tracer injections than just global one.

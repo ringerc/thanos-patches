@@ -70,6 +70,16 @@ Every request against any Thanos component's API with header `X-Thanos-Force-Tra
 
 Currently supported tracing backends:
 
+### No-op (NOOP)
+
+The no-op backend (default) suppresses trace data collection.
+
+It will be used when:
+
+* Both `--tracing.config` and `--tracing.config-file` are absent or empty
+* The content of tracing config file is strictly empty (zero bytes); or
+* A tracing configuration with `type: NOOP` is explicitly provided.
+
 ### OpenTelemetry (OTLP)
 
 Thanos supports exporting traces in the OpenTelemetry Protocol (OTLP). Both gRPC and HTTP clients are supported. Options can be provided also via environment variables. For more details see the [exporter specification](https://github.com/open-telemetry/opentelemetry-specification/blob/main/specification/protocol/exporter.md#configuration-options).
