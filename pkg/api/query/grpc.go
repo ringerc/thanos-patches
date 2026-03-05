@@ -367,8 +367,8 @@ func (g *GRPCAPI) QueryRange(request *querypb.QueryRangeRequest, srv querypb.Que
 	}
 
 	if span := opentracing.SpanFromContext(ctx); span != nil {
-		span.SetTag("query.series", numSeries)
-		span.SetTag("query.samples", numSamples)
+		span.SetTag("result.series", numSeries)
+		span.SetTag("result.samples", numSamples)
 	}
 
 	return nil
