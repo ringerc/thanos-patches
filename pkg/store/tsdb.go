@@ -260,7 +260,8 @@ func (s *TSDBStore) Series(r *storepb.SeriesRequest, seriesSrv storepb.Store_Ser
 		srv = fs
 	}
 
-	if span := opentracing.SpanFromContext(srv.Context()); span != nil {
+	span := opentracing.SpanFromContext(srv.Context())
+	if span != nil {
 		span.SetTag("series.selector", storepb.MatchersToString(r.Matchers...))
 	}
 
@@ -307,7 +308,7 @@ func (s *TSDBStore) Series(r *storepb.SeriesRequest, seriesSrv storepb.Store_Ser
 	}
 	finalExtLset := rmLabels(s.extLset.Copy(), extLsetToRemove)
 
-	var numSeries, numChunks int64
+	var numSeries, numChunks, estimatedBytes int64
 	// Stream at most one series per frame; series may be split over multiple frames according to maxBytesInFrame.
 	for set.Next() {
 		series := set.At()
@@ -319,6 +320,9 @@ func (s *TSDBStore) Series(r *storepb.SeriesRequest, seriesSrv storepb.Store_Ser
 
 		numSeries++
 		storeSeries := storepb.Series{Labels: labelpb.ZLabelsFromPromLabels(completeLabelset)}
+		if span != nil {
+			estimatedBytes += estimateZLabelsMemory(storeSeries.Labels)
+		}
 		if r.SkipChunks {
 			if err := srv.Send(storepb.NewSeriesResponse(&storeSeries)); err != nil {
 				return status.Error(codes.Aborted, err.Error())
@@ -352,9 +356,13 @@ func (s *TSDBStore) Series(r *storepb.SeriesRequest, seriesSrv storepb.Store_Ser
 					Hash: hashChunk(hasher, chunkBytes, enableChunkHashCalculation),
 				},
 			}
-			frameBytesLeft -= c.Size()
+			chunkSize := c.Size()
+			frameBytesLeft -= chunkSize
 			seriesChunks = append(seriesChunks, c)
 			numChunks++
+			if span != nil {
+				estimatedBytes += estimateChunkMemory(c)
+			}
 
 			// We are fine with minor inaccuracy of max bytes per frame. The inaccuracy will be max of full chunk size.
 			isNext = chIter.Next()
@@ -384,9 +392,10 @@ func (s *TSDBStore) Series(r *storepb.SeriesRequest, seriesSrv storepb.Store_Ser
 		}
 	}
 
-	if span := opentracing.SpanFromContext(srv.Context()); span != nil {
+	if span != nil {
 		span.SetTag("result.series", numSeries)
 		span.SetTag("result.samples", numChunks)
+		span.SetTag("result.estimated_bytes", estimatedBytes)
 	}
 
 	return srv.Flush()

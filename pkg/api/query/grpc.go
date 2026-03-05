@@ -12,6 +12,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/storage"
 
@@ -139,12 +140,16 @@ func (g *GRPCAPI) Query(request *querypb.QueryRequest, server querypb.Query_Quer
 		}
 	}
 
-	var numSeries, numSamples int64
+	span := opentracing.SpanFromContext(ctx)
+	var numSeries, numSamples, estimatedMemoryBytes int64
 	batchSize := request.ResponseBatchSize
 	switch vector := result.Value.(type) {
 	case promql.Scalar:
 		numSeries = 1
 		numSamples = 1
+		if span != nil {
+			estimatedMemoryBytes = 16 // timestamp + value
+		}
 		series := &prompb.TimeSeries{
 			Samples: []prompb.Sample{{Value: vector.V, Timestamp: vector.T}},
 		}
@@ -154,6 +159,13 @@ func (g *GRPCAPI) Query(request *querypb.QueryRequest, server querypb.Query_Quer
 	case promql.Vector:
 		numSeries = int64(len(vector))
 		numSamples = int64(len(vector))
+		// Estimate memory for each sample (labels + data) only if tracing
+		if span != nil {
+			for _, sample := range vector {
+				estimatedMemoryBytes += estimateLabelsMemory(sample.Metric)
+				estimatedMemoryBytes += estimateSampleMemory(sample)
+			}
+		}
 		if batchSize <= 1 {
 			for _, sample := range vector {
 				floats, histograms := prompb.SamplesFromPromqlSamples(sample)
@@ -194,9 +206,10 @@ func (g *GRPCAPI) Query(request *querypb.QueryRequest, server querypb.Query_Quer
 		return err
 	}
 
-	if span := opentracing.SpanFromContext(ctx); span != nil {
+	if span != nil {
 		span.SetTag("result.series", numSeries)
 		span.SetTag("result.samples", numSamples)
+		span.SetTag("result.estimated_bytes", estimatedMemoryBytes)
 	}
 
 	return nil
@@ -271,13 +284,21 @@ func (g *GRPCAPI) QueryRange(request *querypb.QueryRangeRequest, srv querypb.Que
 		}
 	}
 
-	var numSeries, numSamples int64
+	span := opentracing.SpanFromContext(ctx)
+	var numSeries, numSamples, estimatedMemoryBytes int64
 	batchSize := request.ResponseBatchSize
 	switch value := result.Value.(type) {
 	case promql.Matrix:
 		numSeries = int64(len(value))
-		for _, s := range value {
-			numSamples += int64(len(s.Floats) + len(s.Histograms))
+		if span != nil {
+			for _, s := range value {
+				numSamples += int64(len(s.Floats) + len(s.Histograms))
+				estimatedMemoryBytes += estimateSeriesMemory(s)
+			}
+		} else {
+			for _, s := range value {
+				numSamples += int64(len(s.Floats) + len(s.Histograms))
+			}
 		}
 		if batchSize <= 1 {
 			for _, series := range value {
@@ -317,6 +338,13 @@ func (g *GRPCAPI) QueryRange(request *querypb.QueryRangeRequest, srv querypb.Que
 	case promql.Vector:
 		numSeries = int64(len(value))
 		numSamples = int64(len(value))
+		// Estimate memory for each sample (labels + data) only if tracing
+		if span != nil {
+			for _, sample := range value {
+				estimatedMemoryBytes += estimateLabelsMemory(sample.Metric)
+				estimatedMemoryBytes += estimateSampleMemory(sample)
+			}
+		}
 		if batchSize <= 1 {
 			for _, sample := range value {
 				floats, histograms := prompb.SamplesFromPromqlSamples(sample)
@@ -355,6 +383,9 @@ func (g *GRPCAPI) QueryRange(request *querypb.QueryRangeRequest, srv querypb.Que
 	case promql.Scalar:
 		numSeries = 1
 		numSamples = 1
+		if span != nil {
+			estimatedMemoryBytes = 16 // timestamp + value
+		}
 		series := &prompb.TimeSeries{
 			Samples: []prompb.Sample{{Value: value.V, Timestamp: value.T}},
 		}
@@ -366,9 +397,10 @@ func (g *GRPCAPI) QueryRange(request *querypb.QueryRangeRequest, srv querypb.Que
 		return err
 	}
 
-	if span := opentracing.SpanFromContext(ctx); span != nil {
+	if span != nil {
 		span.SetTag("result.series", numSeries)
 		span.SetTag("result.samples", numSamples)
+		span.SetTag("result.estimated_bytes", estimatedMemoryBytes)
 	}
 
 	return nil
@@ -389,6 +421,40 @@ func extractQueryStats(qry promql.Query) *querypb.QueryStats {
 	}
 
 	return stats
+}
+
+// estimateLabelsMemory estimates memory usage of label set.
+func estimateLabelsMemory(lbls labels.Labels) int64 {
+	var size int64
+	lbls.Range(func(l labels.Label) {
+		size += int64(len(l.Name) + len(l.Value))
+	})
+	return size
+}
+
+// estimateSampleMemory estimates memory usage of a single sample.
+// Returns 16 bytes for float samples, or ~40 bytes + bucket data for histograms.
+func estimateSampleMemory(sample promql.Sample) int64 {
+	if sample.H != nil {
+		// Native histogram: schema + metadata (~40 bytes) + buckets (8 bytes each)
+		return 40 + int64(len(sample.H.PositiveBuckets)+len(sample.H.NegativeBuckets))*8
+	}
+	// Float sample: timestamp (8 bytes) + value (8 bytes)
+	return 16
+}
+
+// estimateSeriesMemory estimates memory usage of a time series including all samples.
+func estimateSeriesMemory(series promql.Series) int64 {
+	size := estimateLabelsMemory(series.Metric)
+	// Float samples: 16 bytes each (timestamp + value)
+	size += int64(len(series.Floats)) * 16
+	// Histogram samples: estimate based on bucket counts
+	for _, h := range series.Histograms {
+		if h.H != nil {
+			size += 40 + int64(len(h.H.PositiveBuckets)+len(h.H.NegativeBuckets))*8
+		}
+	}
+	return size
 }
 
 func (g *GRPCAPI) getInstantQueryForEngine(
