@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -16,14 +17,9 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
-	"go.opentelemetry.io/collector/component"
-	"go.opentelemetry.io/collector/config/configgrpc"
-	"go.opentelemetry.io/collector/config/confighttp"
-	"go.opentelemetry.io/collector/consumer"
-	"go.opentelemetry.io/collector/pdata/ptrace"
-	"go.opentelemetry.io/collector/receiver"
-	"go.opentelemetry.io/collector/receiver/otlpreceiver"
-	"go.uber.org/zap"
+	otlpcollectortrace "go.opentelemetry.io/proto/otlp/collector/trace/v1"
+	otlptrace "go.opentelemetry.io/proto/otlp/trace/v1"
+	"google.golang.org/grpc"
 )
 
 // TestTraceAttributesWithEmbeddedCollector validates trace attributes using an embedded OTLP collector
@@ -92,107 +88,63 @@ func TestTraceAttributesWithEmbeddedCollector(t *testing.T) {
 	})
 }
 
-// embeddedCollector runs an OTLP receiver and stores received traces
+// embeddedCollector runs a simple OTLP gRPC server and stores received traces
 type embeddedCollector struct {
+	otlpcollectortrace.UnimplementedTraceServiceServer
 	mu         sync.RWMutex
-	traces     []ptrace.Traces
-	receiver   receiver.Traces
-	logger     *zap.Logger
-	grpcServer *http.Server
-	httpServer *http.Server
+	traces     []*otlptrace.ResourceSpans
+	grpcServer *grpc.Server
+	listener   net.Listener
 }
 
 func newEmbeddedCollector(t *testing.T) *embeddedCollector {
-	logger, err := zap.NewDevelopment()
-	require.NoError(t, err)
-
 	return &embeddedCollector{
-		traces: make([]ptrace.Traces, 0),
-		logger: logger,
+		traces: make([]*otlptrace.ResourceSpans, 0),
 	}
 }
 
 func (c *embeddedCollector) Start(ctx context.Context, t *testing.T) string {
-	// Create a consumer that stores traces
-	traceConsumer := &traceStorageConsumer{collector: c}
-
-	// Configure OTLP receiver
-	factory := otlpreceiver.NewFactory()
-	cfg := factory.CreateDefaultConfig().(*otlpreceiver.Config)
-
-	// Configure gRPC endpoint
-	cfg.Protocols.GRPC = &configgrpc.ServerConfig{}
-	cfg.Protocols.GRPC.NetAddr.Endpoint = "localhost:14317"
-
-	// Configure HTTP endpoint
-	cfg.Protocols.HTTP = &otlpreceiver.HTTPConfig{
-		ServerConfig: &confighttp.ServerConfig{
-			Endpoint: "localhost:14318",
-		},
-	}
-
-	// Create receiver
-	set := receiver.Settings{
-		TelemetrySettings: component.TelemetrySettings{
-			Logger: c.logger,
-		},
-	}
-
 	var err error
-	c.receiver, err = factory.CreateTraces(ctx, set, cfg, traceConsumer)
+	c.listener, err = net.Listen("tcp", "localhost:14317")
 	require.NoError(t, err)
 
-	// Start receiver
-	err = c.receiver.Start(ctx, componentHost{})
-	require.NoError(t, err)
+	c.grpcServer = grpc.NewServer()
+	otlpcollectortrace.RegisterTraceServiceServer(c.grpcServer, c)
 
-	t.Log("OTLP collector started on localhost:14317 (gRPC) and localhost:14318 (HTTP)")
+	go func() {
+		if err := c.grpcServer.Serve(c.listener); err != nil {
+			t.Logf("OTLP server error: %v", err)
+		}
+	}()
+
+	t.Log("OTLP collector started on localhost:14317")
 	return "localhost:14317"
 }
 
 func (c *embeddedCollector) Stop() {
-	if c.receiver != nil {
-		c.receiver.Shutdown(context.Background())
+	if c.grpcServer != nil {
+		c.grpcServer.Stop()
+	}
+	if c.listener != nil {
+		c.listener.Close()
 	}
 }
 
-func (c *embeddedCollector) GetTraces() []ptrace.Traces {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return append([]ptrace.Traces{}, c.traces...)
-}
-
-func (c *embeddedCollector) addTrace(trace ptrace.Traces) {
+// Export implements otlpcollectortrace.TraceServiceServer
+func (c *embeddedCollector) Export(ctx context.Context, req *otlpcollectortrace.ExportTraceServiceRequest) (*otlpcollectortrace.ExportTraceServiceResponse, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.traces = append(c.traces, trace)
+
+	c.traces = append(c.traces, req.ResourceSpans...)
+
+	return &otlpcollectortrace.ExportTraceServiceResponse{}, nil
 }
 
-// traceStorageConsumer implements consumer.Traces
-type traceStorageConsumer struct {
-	collector *embeddedCollector
+func (c *embeddedCollector) GetTraces() []*otlptrace.ResourceSpans {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return append([]*otlptrace.ResourceSpans{}, c.traces...)
 }
-
-func (t *traceStorageConsumer) Capabilities() consumer.Capabilities {
-	return consumer.Capabilities{MutatesData: false}
-}
-
-func (t *traceStorageConsumer) ConsumeTraces(ctx context.Context, td ptrace.Traces) error {
-	t.collector.addTrace(td)
-	t.collector.logger.Info("Received trace",
-		zap.Int("resource_spans", td.ResourceSpans().Len()),
-		zap.Int("total_spans", td.SpanCount()),
-	)
-	return nil
-}
-
-// componentHost implements component.Host (minimal implementation)
-type componentHost struct{}
-
-func (componentHost) ReportFatalError(err error)                          {}
-func (componentHost) GetFactory(component.Kind, component.Type) component.Factory { return nil }
-func (componentHost) GetExtensions() map[component.ID]component.Component { return nil }
-func (componentHost) GetExporters() map[component.ID]component.Component  { return nil }
 
 // Helper functions
 
@@ -402,49 +354,33 @@ func validateQueryTraceAttributes(t *testing.T, collector *embeddedCollector) {
 	foundEstimatedBytes := false
 	foundWireBytes := false
 
-	for _, trace := range traces {
-		for i := 0; i < trace.ResourceSpans().Len(); i++ {
-			rs := trace.ResourceSpans().At(i)
-			for j := 0; j < rs.ScopeSpans().Len(); j++ {
-				ss := rs.ScopeSpans().At(j)
-				for k := 0; k < ss.Spans().Len(); k++ {
-					span := ss.Spans().At(k)
-					spanName := span.Name()
+	for _, rs := range traces {
+		for _, scopeSpans := range rs.ScopeSpans {
+			for _, span := range scopeSpans.Spans {
+				spanName := span.Name
 
-					// Look for Query or QueryRange spans
-					if spanName != "/thanos.Query/Query" && spanName != "/thanos.Query/QueryRange" {
-						continue
-					}
+				// Look for Query or QueryRange spans
+				if spanName != "/thanos.Query/Query" && spanName != "/thanos.Query/QueryRange" {
+					continue
+				}
 
-					attrs := span.Attributes()
-
-					// Check for query.expr
-					if val, ok := attrs.Get("query.expr"); ok {
-						t.Logf("Found query.expr: %v", val.AsString())
+				// Check attributes
+				for _, attr := range span.Attributes {
+					switch attr.Key {
+					case "query.expr":
+						t.Logf("Found query.expr: %v", attr.Value.GetStringValue())
 						foundQueryExpr = true
-					}
-
-					// Check for result.series
-					if val, ok := attrs.Get("result.series"); ok {
-						t.Logf("Found result.series: %v", val.Int())
+					case "result.series":
+						t.Logf("Found result.series: %v", attr.Value.GetIntValue())
 						foundResultSeries = true
-					}
-
-					// Check for result.samples
-					if val, ok := attrs.Get("result.samples"); ok {
-						t.Logf("Found result.samples: %v", val.Int())
+					case "result.samples":
+						t.Logf("Found result.samples: %v", attr.Value.GetIntValue())
 						foundResultSamples = true
-					}
-
-					// Check for result.estimated_bytes
-					if val, ok := attrs.Get("result.estimated_bytes"); ok {
-						t.Logf("Found result.estimated_bytes: %v", val.Int())
+					case "result.estimated_bytes":
+						t.Logf("Found result.estimated_bytes: %v", attr.Value.GetIntValue())
 						foundEstimatedBytes = true
-					}
-
-					// Check for result.wire_bytes
-					if val, ok := attrs.Get("result.wire_bytes"); ok {
-						t.Logf("Found result.wire_bytes: %v", val.Int())
+					case "result.wire_bytes":
+						t.Logf("Found result.wire_bytes: %v", attr.Value.GetIntValue())
 						foundWireBytes = true
 					}
 				}
@@ -471,49 +407,33 @@ func validateSeriesTraceAttributes(t *testing.T, collector *embeddedCollector) {
 	foundEstimatedBytes := false
 	foundWireBytes := false
 
-	for _, trace := range traces {
-		for i := 0; i < trace.ResourceSpans().Len(); i++ {
-			rs := trace.ResourceSpans().At(i)
-			for j := 0; j < rs.ScopeSpans().Len(); j++ {
-				ss := rs.ScopeSpans().At(j)
-				for k := 0; k < ss.Spans().Len(); k++ {
-					span := ss.Spans().At(k)
-					spanName := span.Name()
+	for _, rs := range traces {
+		for _, scopeSpans := range rs.ScopeSpans {
+			for _, span := range scopeSpans.Spans {
+				spanName := span.Name
 
-					// Look for Series spans
-					if spanName != "proxy.series" && spanName != "/thanos.Store/Series" {
-						continue
-					}
+				// Look for Series spans
+				if spanName != "proxy.series" && spanName != "/thanos.Store/Series" {
+					continue
+				}
 
-					attrs := span.Attributes()
-
-					// Check for series.selector
-					if val, ok := attrs.Get("series.selector"); ok {
-						t.Logf("Found series.selector: %v", val.AsString())
+				// Check attributes
+				for _, attr := range span.Attributes {
+					switch attr.Key {
+					case "series.selector":
+						t.Logf("Found series.selector: %v", attr.Value.GetStringValue())
 						foundSeriesSelector = true
-					}
-
-					// Check for result.series
-					if val, ok := attrs.Get("result.series"); ok {
-						t.Logf("Found result.series: %v", val.Int())
+					case "result.series":
+						t.Logf("Found result.series: %v", attr.Value.GetIntValue())
 						foundResultSeries = true
-					}
-
-					// Check for result.samples
-					if val, ok := attrs.Get("result.samples"); ok {
-						t.Logf("Found result.samples: %v", val.Int())
+					case "result.samples":
+						t.Logf("Found result.samples: %v", attr.Value.GetIntValue())
 						foundResultSamples = true
-					}
-
-					// Check for result.estimated_bytes
-					if val, ok := attrs.Get("result.estimated_bytes"); ok {
-						t.Logf("Found result.estimated_bytes: %v", val.Int())
+					case "result.estimated_bytes":
+						t.Logf("Found result.estimated_bytes: %v", attr.Value.GetIntValue())
 						foundEstimatedBytes = true
-					}
-
-					// Check for result.wire_bytes
-					if val, ok := attrs.Get("result.wire_bytes"); ok {
-						t.Logf("Found result.wire_bytes: %v", val.Int())
+					case "result.wire_bytes":
+						t.Logf("Found result.wire_bytes: %v", attr.Value.GetIntValue())
 						foundWireBytes = true
 					}
 				}

@@ -1,15 +1,15 @@
 # OpenTelemetry Integration Tests
 
-This module contains integration tests for validating distributed tracing attributes in Thanos using an embedded OpenTelemetry collector.
+This module contains integration tests for validating distributed tracing attributes in Thanos using an embedded OTLP server.
 
 ## Overview
 
 Unlike the e2e tests which use Docker containers, these integration tests:
 - Run as a **separate Go module** with its own dependencies
-- **Embed an OTLP receiver** using the OpenTelemetry Collector SDK
+- **Embed a lightweight OTLP gRPC server** using protobuf definitions
 - **Build Thanos binaries** from source for each test run
 - Run **Prometheus**, **Thanos Sidecar**, and **Thanos Query** as subprocesses
-- Configure all components to send traces to the embedded OTLP collector
+- Configure all components to send traces to the embedded OTLP server
 - Validate trace span attributes programmatically
 
 ## Architecture
@@ -22,8 +22,8 @@ Unlike the e2e tests which use Docker containers, these integration tests:
         │
         ├─ Build Thanos Binary
         │
-        ├─ Start Embedded OTLP Collector
-        │       └─ In-process receiver
+        ├─ Start Embedded OTLP Server
+        │       └─ Lightweight gRPC server (localhost:14317)
         │
         ├─ Start Prometheus (subprocess)
         │       └─ Scrapes itself
@@ -38,7 +38,7 @@ Unlike the e2e tests which use Docker containers, these integration tests:
         │       └─ HTTP → Query → Sidecar
         │
         └─ Validate Trace Attributes
-                └─ Check embedded collector's stored spans
+                └─ Check OTLP server's collected spans
 ```
 
 ## Prerequisites

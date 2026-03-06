@@ -6,10 +6,11 @@ This integration test validates that Thanos components correctly emit distribute
 
 ## Key Features
 
-✅ **Embedded OTLP Collector** - Runs an OpenTelemetry collector receiver in-process
+✅ **Embedded OTLP Server** - Runs a lightweight OTLP gRPC server in-process to collect traces
 ✅ **Automatic Binary Building** - Builds Thanos from source for each test run
 ✅ **Full Stack Testing** - Tests Prometheus → Sidecar → Query chain
 ✅ **Programmatic Validation** - Validates trace attributes directly in Go code
+✅ **No External Dependencies** - Uses minimal OTLP protobuf definitions without full collector framework
 
 ## Running the Tests
 
