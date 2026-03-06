@@ -1,0 +1,33 @@
+# Test binaries
+*.test
+otel.test
+
+# Thanos binary (built for manual testing)
+thanos
+
+# Go workspace
+go.work
+go.work.sum
+
+# Test coverage
+*.out
+coverage.html
+coverage.txt
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary test directories (if not cleaned up)
+tmp/
+test-*
+
+# Dependencies (if vendored)
+vendor/
