@@ -363,7 +363,7 @@ func (s *ProxyStore) Series(originalRequest *storepb.SeriesRequest, seriesSrv st
 		respHeap = NewResponseDeduplicator(respHeap)
 	}
 
-	var numSeries, numChunks, estimatedBytes int64
+	var numSeries, numChunks, estimatedBytes, wireBytes int64
 	i := 0
 	for respHeap.Next() {
 		i++
@@ -385,6 +385,7 @@ func (s *ProxyStore) Series(originalRequest *storepb.SeriesRequest, seriesSrv st
 			}
 		}
 
+		wireBytes += int64(resp.Size())
 		if err := srv.Send(resp); err != nil {
 			level.Error(reqLogger).Log("msg", "failed to stream response", "error", err)
 			return status.Error(codes.Unknown, errors.Wrap(err, "send series response").Error())
@@ -395,6 +396,7 @@ func (s *ProxyStore) Series(originalRequest *storepb.SeriesRequest, seriesSrv st
 		span.SetTag("result.series", numSeries)
 		span.SetTag("result.samples", numChunks)
 		span.SetTag("result.estimated_bytes", estimatedBytes)
+		span.SetTag("result.wire_bytes", wireBytes)
 	}
 
 	// Flush any remaining buffered series from the batchable server.

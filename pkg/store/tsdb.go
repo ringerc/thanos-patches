@@ -308,7 +308,7 @@ func (s *TSDBStore) Series(r *storepb.SeriesRequest, seriesSrv storepb.Store_Ser
 	}
 	finalExtLset := rmLabels(s.extLset.Copy(), extLsetToRemove)
 
-	var numSeries, numChunks, estimatedBytes int64
+	var numSeries, numChunks, estimatedBytes, wireBytes int64
 	// Stream at most one series per frame; series may be split over multiple frames according to maxBytesInFrame.
 	for set.Next() {
 		series := set.At()
@@ -324,7 +324,9 @@ func (s *TSDBStore) Series(r *storepb.SeriesRequest, seriesSrv storepb.Store_Ser
 			estimatedBytes += estimateZLabelsMemory(storeSeries.Labels)
 		}
 		if r.SkipChunks {
-			if err := srv.Send(storepb.NewSeriesResponse(&storeSeries)); err != nil {
+			resp := storepb.NewSeriesResponse(&storeSeries)
+			wireBytes += int64(resp.Size())
+			if err := srv.Send(resp); err != nil {
 				return status.Error(codes.Aborted, err.Error())
 			}
 			continue
@@ -369,7 +371,9 @@ func (s *TSDBStore) Series(r *storepb.SeriesRequest, seriesSrv storepb.Store_Ser
 			if frameBytesLeft > 0 && isNext {
 				continue
 			}
-			if err := srv.Send(storepb.NewSeriesResponse(&storepb.Series{Labels: storeSeries.Labels, Chunks: seriesChunks})); err != nil {
+			resp := storepb.NewSeriesResponse(&storepb.Series{Labels: storeSeries.Labels, Chunks: seriesChunks})
+			wireBytes += int64(resp.Size())
+			if err := srv.Send(resp); err != nil {
 				return status.Error(codes.Aborted, err.Error())
 			}
 
@@ -387,7 +391,9 @@ func (s *TSDBStore) Series(r *storepb.SeriesRequest, seriesSrv storepb.Store_Ser
 		return status.Error(codes.Internal, err.Error())
 	}
 	for _, w := range set.Warnings() {
-		if err := srv.Send(storepb.NewWarnSeriesResponse(w)); err != nil {
+		warnResp := storepb.NewWarnSeriesResponse(w)
+		wireBytes += int64(warnResp.Size())
+		if err := srv.Send(warnResp); err != nil {
 			return status.Error(codes.Aborted, err.Error())
 		}
 	}
@@ -396,6 +402,7 @@ func (s *TSDBStore) Series(r *storepb.SeriesRequest, seriesSrv storepb.Store_Ser
 		span.SetTag("result.series", numSeries)
 		span.SetTag("result.samples", numChunks)
 		span.SetTag("result.estimated_bytes", estimatedBytes)
+		span.SetTag("result.wire_bytes", wireBytes)
 	}
 
 	return srv.Flush()

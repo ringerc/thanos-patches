@@ -1812,7 +1812,7 @@ func (s *BucketStore) Series(req *storepb.SeriesRequest, seriesSrv storepb.Store
 	lt := NewProxyResponseLoserTree(respSets...)
 	defer lt.Close()
 	// Merge the sub-results from each selected block.
-	var estimatedBytes int64
+	var estimatedBytes, wireBytes int64
 	tracing.DoInSpan(ctx, "bucket_store_merge_all", func(ctx context.Context) {
 		begin := time.Now()
 		set := NewResponseDeduplicator(lt)
@@ -1848,6 +1848,7 @@ func (s *BucketStore) Series(req *storepb.SeriesRequest, seriesSrv storepb.Store
 					s.metrics.chunkSizeBytes.WithLabelValues(tenant).Observe(float64(chunkBytes))
 				}
 			}
+			wireBytes += int64(at.Size())
 			if err = srv.Send(at); err != nil {
 				err = status.Error(codes.Unknown, errors.Wrap(err, "send series response").Error())
 				return
@@ -1873,7 +1874,9 @@ func (s *BucketStore) Series(req *storepb.SeriesRequest, seriesSrv storepb.Store
 			return
 		}
 
-		if err = srv.Send(storepb.NewHintsSeriesResponse(anyHints)); err != nil {
+		hintsResp := storepb.NewHintsSeriesResponse(anyHints)
+		wireBytes += int64(hintsResp.Size())
+		if err = srv.Send(hintsResp); err != nil {
 			err = status.Error(codes.Unknown, errors.Wrap(err, "send series response hints").Error())
 			return
 		}
@@ -1887,6 +1890,7 @@ func (s *BucketStore) Series(req *storepb.SeriesRequest, seriesSrv storepb.Store
 		span.SetTag("result.series", stats.mergedSeriesCount)
 		span.SetTag("result.samples", stats.mergedChunksCount)
 		span.SetTag("result.estimated_bytes", estimatedBytes)
+		span.SetTag("result.wire_bytes", wireBytes)
 	}
 
 	return srv.Flush()

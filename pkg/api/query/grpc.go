@@ -141,7 +141,7 @@ func (g *GRPCAPI) Query(request *querypb.QueryRequest, server querypb.Query_Quer
 	}
 
 	span := opentracing.SpanFromContext(ctx)
-	var numSeries, numSamples, estimatedMemoryBytes int64
+	var numSeries, numSamples, estimatedMemoryBytes, wireBytes int64
 	batchSize := request.ResponseBatchSize
 	switch vector := result.Value.(type) {
 	case promql.Scalar:
@@ -153,7 +153,9 @@ func (g *GRPCAPI) Query(request *querypb.QueryRequest, server querypb.Query_Quer
 		series := &prompb.TimeSeries{
 			Samples: []prompb.Sample{{Value: vector.V, Timestamp: vector.T}},
 		}
-		if err := server.Send(querypb.NewQueryResponse(series)); err != nil {
+		resp := querypb.NewQueryResponse(series)
+		wireBytes += int64(resp.Size())
+		if err := server.Send(resp); err != nil {
 			return err
 		}
 	case promql.Vector:
@@ -174,7 +176,9 @@ func (g *GRPCAPI) Query(request *querypb.QueryRequest, server querypb.Query_Quer
 					Samples:    floats,
 					Histograms: histograms,
 				}
-				if err := server.Send(querypb.NewQueryResponse(series)); err != nil {
+				resp := querypb.NewQueryResponse(series)
+				wireBytes += int64(resp.Size())
+				if err := server.Send(resp); err != nil {
 					return err
 				}
 			}
@@ -189,20 +193,26 @@ func (g *GRPCAPI) Query(request *querypb.QueryRequest, server querypb.Query_Quer
 				}
 				batch = append(batch, series)
 				if int64(len(batch)) >= batchSize {
-					if err := server.Send(querypb.NewQueryBatchResponse(batch)); err != nil {
+					resp := querypb.NewQueryBatchResponse(batch)
+					wireBytes += int64(resp.Size())
+					if err := server.Send(resp); err != nil {
 						return err
 					}
 					batch = make([]*prompb.TimeSeries, 0, batchSize)
 				}
 			}
 			if len(batch) > 0 {
-				if err := server.Send(querypb.NewQueryBatchResponse(batch)); err != nil {
+				resp := querypb.NewQueryBatchResponse(batch)
+				wireBytes += int64(resp.Size())
+				if err := server.Send(resp); err != nil {
 					return err
 				}
 			}
 		}
 	}
-	if err := server.Send(querypb.NewQueryStatsResponse(extractQueryStats(qry))); err != nil {
+	statsResp := querypb.NewQueryStatsResponse(extractQueryStats(qry))
+	wireBytes += int64(statsResp.Size())
+	if err := server.Send(statsResp); err != nil {
 		return err
 	}
 
@@ -210,6 +220,7 @@ func (g *GRPCAPI) Query(request *querypb.QueryRequest, server querypb.Query_Quer
 		span.SetTag("result.series", numSeries)
 		span.SetTag("result.samples", numSamples)
 		span.SetTag("result.estimated_bytes", estimatedMemoryBytes)
+		span.SetTag("result.wire_bytes", wireBytes)
 	}
 
 	return nil
@@ -278,8 +289,11 @@ func (g *GRPCAPI) QueryRange(request *querypb.QueryRangeRequest, srv querypb.Que
 		return status.Error(codes.Aborted, result.Err.Error())
 	}
 
+	var wireBytes int64
 	if len(result.Warnings) != 0 {
-		if err := srv.Send(querypb.NewQueryRangeWarningsResponse(result.Warnings.AsErrors()...)); err != nil {
+		warningResp := querypb.NewQueryRangeWarningsResponse(result.Warnings.AsErrors()...)
+		wireBytes += int64(warningResp.Size())
+		if err := srv.Send(warningResp); err != nil {
 			return err
 		}
 	}
@@ -308,7 +322,9 @@ func (g *GRPCAPI) QueryRange(request *querypb.QueryRangeRequest, srv querypb.Que
 					Samples:    floats,
 					Histograms: histograms,
 				}
-				if err := srv.Send(querypb.NewQueryRangeResponse(ts)); err != nil {
+				resp := querypb.NewQueryRangeResponse(ts)
+				wireBytes += int64(resp.Size())
+				if err := srv.Send(resp); err != nil {
 					return err
 				}
 			}
@@ -323,14 +339,18 @@ func (g *GRPCAPI) QueryRange(request *querypb.QueryRangeRequest, srv querypb.Que
 				}
 				batch = append(batch, ts)
 				if int64(len(batch)) >= batchSize {
-					if err := srv.Send(querypb.NewQueryRangeBatchResponse(batch)); err != nil {
+					resp := querypb.NewQueryRangeBatchResponse(batch)
+					wireBytes += int64(resp.Size())
+					if err := srv.Send(resp); err != nil {
 						return err
 					}
 					batch = make([]*prompb.TimeSeries, 0, batchSize)
 				}
 			}
 			if len(batch) > 0 {
-				if err := srv.Send(querypb.NewQueryRangeBatchResponse(batch)); err != nil {
+				resp := querypb.NewQueryRangeBatchResponse(batch)
+				wireBytes += int64(resp.Size())
+				if err := srv.Send(resp); err != nil {
 					return err
 				}
 			}
@@ -353,7 +373,9 @@ func (g *GRPCAPI) QueryRange(request *querypb.QueryRangeRequest, srv querypb.Que
 					Samples:    floats,
 					Histograms: histograms,
 				}
-				if err := srv.Send(querypb.NewQueryRangeResponse(series)); err != nil {
+				resp := querypb.NewQueryRangeResponse(series)
+				wireBytes += int64(resp.Size())
+				if err := srv.Send(resp); err != nil {
 					return err
 				}
 			}
@@ -368,14 +390,18 @@ func (g *GRPCAPI) QueryRange(request *querypb.QueryRangeRequest, srv querypb.Que
 				}
 				batch = append(batch, series)
 				if int64(len(batch)) >= batchSize {
-					if err := srv.Send(querypb.NewQueryRangeBatchResponse(batch)); err != nil {
+					resp := querypb.NewQueryRangeBatchResponse(batch)
+					wireBytes += int64(resp.Size())
+					if err := srv.Send(resp); err != nil {
 						return err
 					}
 					batch = make([]*prompb.TimeSeries, 0, batchSize)
 				}
 			}
 			if len(batch) > 0 {
-				if err := srv.Send(querypb.NewQueryRangeBatchResponse(batch)); err != nil {
+				resp := querypb.NewQueryRangeBatchResponse(batch)
+				wireBytes += int64(resp.Size())
+				if err := srv.Send(resp); err != nil {
 					return err
 				}
 			}
@@ -389,11 +415,15 @@ func (g *GRPCAPI) QueryRange(request *querypb.QueryRangeRequest, srv querypb.Que
 		series := &prompb.TimeSeries{
 			Samples: []prompb.Sample{{Value: value.V, Timestamp: value.T}},
 		}
-		if err := srv.Send(querypb.NewQueryRangeResponse(series)); err != nil {
+		resp := querypb.NewQueryRangeResponse(series)
+		wireBytes += int64(resp.Size())
+		if err := srv.Send(resp); err != nil {
 			return err
 		}
 	}
-	if err := srv.Send(querypb.NewQueryRangeStatsResponse(extractQueryStats(qry))); err != nil {
+	statsResp := querypb.NewQueryRangeStatsResponse(extractQueryStats(qry))
+	wireBytes += int64(statsResp.Size())
+	if err := srv.Send(statsResp); err != nil {
 		return err
 	}
 
@@ -401,6 +431,7 @@ func (g *GRPCAPI) QueryRange(request *querypb.QueryRangeRequest, srv querypb.Que
 		span.SetTag("result.series", numSeries)
 		span.SetTag("result.samples", numSamples)
 		span.SetTag("result.estimated_bytes", estimatedMemoryBytes)
+		span.SetTag("result.wire_bytes", wireBytes)
 	}
 
 	return nil

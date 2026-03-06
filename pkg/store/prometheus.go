@@ -164,7 +164,7 @@ func (p *PrometheusStore) Series(r *storepb.SeriesRequest, seriesSrv storepb.Sto
 			return err
 		}
 		var b labels.Builder
-		var numSeries, estimatedBytes int64
+		var numSeries, estimatedBytes, wireBytes int64
 		for _, lbm := range labelMaps {
 			b.Reset(labels.EmptyLabels())
 			for k, v := range lbm {
@@ -178,7 +178,9 @@ func (p *PrometheusStore) Series(r *storepb.SeriesRequest, seriesSrv storepb.Sto
 				b.Set(l.Name, l.Value)
 			})
 			lset := labelpb.ZLabelsFromPromLabels(b.Labels())
-			if err = s.Send(storepb.NewSeriesResponse(&storepb.Series{Labels: lset})); err != nil {
+			resp := storepb.NewSeriesResponse(&storepb.Series{Labels: lset})
+			wireBytes += int64(resp.Size())
+			if err = s.Send(resp); err != nil {
 				return err
 			}
 			numSeries++
@@ -187,6 +189,7 @@ func (p *PrometheusStore) Series(r *storepb.SeriesRequest, seriesSrv storepb.Sto
 			span.SetTag("result.series", numSeries)
 			span.SetTag("result.samples", int64(0))
 			span.SetTag("result.estimated_bytes", estimatedBytes)
+			span.SetTag("result.wire_bytes", wireBytes)
 		}
 		return s.Flush()
 	}
@@ -255,7 +258,7 @@ func (p *PrometheusStore) handleSampledPrometheusResponse(
 	defer span.Finish()
 	span.SetTag("series_count", len(resp.Results[0].Timeseries))
 
-	var numSeries, numChunks, estimatedBytes int64
+	var numSeries, numChunks, estimatedBytes, wireBytes int64
 	for _, e := range resp.Results[0].Timeseries {
 		// https://github.com/prometheus/prometheus/blob/3f6f5d3357e232abe53f1775f893fdf8f842712c/storage/remote/read_handler.go#L166
 		// MergeLabels() prefers local labels over external labels but we prefer
@@ -290,10 +293,12 @@ func (p *PrometheusStore) handleSampledPrometheusResponse(
 		if span != nil {
 			estimatedBytes += estimateChunksMemory(aggregatedChunks)
 		}
-		if err := s.Send(storepb.NewSeriesResponse(&storepb.Series{
+		resp := storepb.NewSeriesResponse(&storepb.Series{
 			Labels: labelpb.ZLabelsFromPromLabels(lset),
 			Chunks: aggregatedChunks,
-		})); err != nil {
+		})
+		wireBytes += int64(resp.Size())
+		if err := s.Send(resp); err != nil {
 			return err
 		}
 	}
@@ -303,6 +308,7 @@ func (p *PrometheusStore) handleSampledPrometheusResponse(
 		span.SetTag("result.series", numSeries)
 		span.SetTag("result.samples", numChunks)
 		span.SetTag("result.estimated_bytes", estimatedBytes)
+		span.SetTag("result.wire_bytes", wireBytes)
 	}
 
 	return s.Flush()
@@ -333,7 +339,7 @@ func (p *PrometheusStore) handleStreamedPrometheusResponse(
 
 	bodySizer := NewBytesRead(httpResp.Body)
 	seriesStats := &storepb.SeriesStatsCounter{}
-	var estimatedBytes int64
+	var estimatedBytes, wireBytes int64
 	span := opentracing.SpanFromContext(s.Context())
 
 	// TODO(bwplotka): Put read limit as a flag.
@@ -402,6 +408,7 @@ func (p *PrometheusStore) handleStreamedPrometheusResponse(
 				Labels: labelpb.ZLabelsFromPromLabels(completeLabelset),
 				Chunks: thanosChks,
 			})
+			wireBytes += int64(r.Size())
 			if err := s.Send(r); err != nil {
 				return err
 			}
@@ -418,6 +425,7 @@ func (p *PrometheusStore) handleStreamedPrometheusResponse(
 		span.SetTag("result.series", int64(seriesStats.Series))
 		span.SetTag("result.samples", int64(seriesStats.Chunks))
 		span.SetTag("result.estimated_bytes", estimatedBytes)
+		span.SetTag("result.wire_bytes", wireBytes)
 	}
 
 	return s.Flush()
