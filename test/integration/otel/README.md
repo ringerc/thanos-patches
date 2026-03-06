@@ -7,8 +7,9 @@ This module contains integration tests for validating distributed tracing attrib
 Unlike the e2e tests which use Docker containers, these integration tests:
 - Run as a **separate Go module** with its own dependencies
 - **Embed a lightweight OTLP gRPC server** using protobuf definitions
+- **Embed Prometheus** with TSDB storage and PromQL engine in-process
 - **Build Thanos binaries** from source for each test run
-- Run **Prometheus**, **Thanos Sidecar**, and **Thanos Query** as subprocesses
+- Run **Thanos Sidecar** and **Thanos Query** as subprocesses
 - Configure all components to send traces to the embedded OTLP server
 - Validate trace span attributes programmatically
 
@@ -25,8 +26,10 @@ Unlike the e2e tests which use Docker containers, these integration tests:
         ├─ Start Embedded OTLP Server
         │       └─ Lightweight gRPC server (localhost:14317)
         │
-        ├─ Start Prometheus (subprocess)
-        │       └─ Scrapes itself
+        ├─ Start Embedded Prometheus
+        │       ├─ TSDB storage with test data
+        │       ├─ PromQL engine
+        │       └─ HTTP API (localhost:9090)
         │
         ├─ Start Thanos Sidecar (subprocess)
         │       └─ OTLP traces → localhost:14317
@@ -35,7 +38,7 @@ Unlike the e2e tests which use Docker containers, these integration tests:
         │       └─ OTLP traces → localhost:14317
         │
         ├─ Execute Test Queries
-        │       └─ HTTP → Query → Sidecar
+        │       └─ HTTP → Query → Sidecar → Prometheus
         │
         └─ Validate Trace Attributes
                 └─ Check OTLP server's collected spans
@@ -44,8 +47,7 @@ Unlike the e2e tests which use Docker containers, these integration tests:
 ## Prerequisites
 
 - **Go 1.23 or later**
-- **Prometheus binary** in PATH (for test setup)
-- **Docker** (only for optional manual testing)
+- **No external dependencies** - Prometheus is embedded in-process
 
 ## Running the Tests
 

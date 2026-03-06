@@ -5,17 +5,24 @@ package otel_test
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/promql"
+	"github.com/prometheus/prometheus/tsdb"
 	"github.com/stretchr/testify/require"
 	otlpcollectortrace "go.opentelemetry.io/proto/otlp/collector/trace/v1"
 	otlptrace "go.opentelemetry.io/proto/otlp/trace/v1"
@@ -46,13 +53,14 @@ func TestTraceAttributesWithEmbeddedCollector(t *testing.T) {
 	collectorAddr := collector.Start(ctx, t)
 	defer collector.Stop()
 
-	// Start Prometheus
-	t.Log("Starting Prometheus...")
-	promConfig := createPrometheusConfig(t, tmpDir)
+	// Start embedded Prometheus
+	t.Log("Starting embedded Prometheus...")
 	promPort := 9090
-	promCmd := startPrometheus(t, ctx, tmpDir, promConfig, promPort)
-	defer promCmd.Process.Kill()
-	waitForPrometheus(t, ctx, promPort)
+	promDB, stopPrometheus := startEmbeddedPrometheus(t, ctx, tmpDir, promPort)
+	defer stopPrometheus()
+
+	// Write test data to Prometheus TSDB
+	writePrometheusTestData(t, promDB)
 
 	// Start Thanos Sidecar with OTLP tracing
 	t.Log("Starting Thanos Sidecar with OTLP tracing...")
@@ -148,6 +156,157 @@ func (c *embeddedCollector) GetTraces() []*otlptrace.ResourceSpans {
 
 // Helper functions
 
+// startEmbeddedPrometheus starts Prometheus in-process with TSDB and HTTP API
+func startEmbeddedPrometheus(t *testing.T, ctx context.Context, tmpDir string, port int) (*tsdb.DB, func()) {
+	t.Helper()
+
+	// Create TSDB storage
+	dataDir := filepath.Join(tmpDir, "prometheus-data")
+	require.NoError(t, os.MkdirAll(dataDir, 0755))
+
+	opts := tsdb.DefaultOptions()
+	opts.RetentionDuration = 2 * 60 * 60 * 1000 // 2 hours in milliseconds
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	promDB, err := tsdb.Open(dataDir, logger, prometheus.NewRegistry(), opts, nil)
+	require.NoError(t, err)
+
+	// Create PromQL engine
+	engineOpts := promql.EngineOpts{
+		Logger:        logger,
+		Reg:           prometheus.NewRegistry(),
+		MaxSamples:    50000000,
+		Timeout:       2 * time.Minute,
+		LookbackDelta: 5 * time.Minute,
+	}
+	queryEngine := promql.NewEngine(engineOpts)
+
+	// Create simple HTTP handlers for Prometheus API
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/api/v1/query", func(w http.ResponseWriter, r *http.Request) {
+		query := r.URL.Query().Get("query")
+		timeParam := r.URL.Query().Get("time")
+
+		var ts time.Time
+		if timeParam != "" {
+			if f, err := strconv.ParseFloat(timeParam, 64); err == nil {
+				ts = time.Unix(int64(f), 0)
+			} else {
+				ts = time.Now()
+			}
+		} else {
+			ts = time.Now()
+		}
+
+		qry, err := queryEngine.NewInstantQuery(ctx, promDB, nil, query, ts)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"status": "error", "error": err.Error()})
+			return
+		}
+		defer qry.Close()
+
+		res := qry.Exec(ctx)
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"status": "success",
+			"data": map[string]any{
+				"resultType": res.Value.Type(),
+				"result":     res.Value,
+			},
+		})
+	})
+
+	mux.HandleFunc("/api/v1/query_range", func(w http.ResponseWriter, r *http.Request) {
+		query := r.URL.Query().Get("query")
+		start := r.URL.Query().Get("start")
+		end := r.URL.Query().Get("end")
+		step := r.URL.Query().Get("step")
+
+		startTime, _ := strconv.ParseInt(start, 10, 64)
+		endTime, _ := strconv.ParseInt(end, 10, 64)
+		stepDuration, _ := strconv.ParseInt(step, 10, 64)
+
+		qry, err := queryEngine.NewRangeQuery(
+			ctx,
+			promDB,
+			nil,
+			query,
+			time.Unix(startTime, 0),
+			time.Unix(endTime, 0),
+			time.Duration(stepDuration)*time.Second,
+		)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"status": "error", "error": err.Error()})
+			return
+		}
+		defer qry.Close()
+
+		res := qry.Exec(ctx)
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"status": "success",
+			"data": map[string]any{
+				"resultType": res.Value.Type(),
+				"result":     res.Value,
+			},
+		})
+	})
+
+	mux.HandleFunc("/-/ready", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("OK"))
+	})
+
+	// Start HTTP server
+	listener, err := net.Listen("tcp", fmt.Sprintf("localhost:%d", port))
+	require.NoError(t, err)
+
+	server := &http.Server{
+		Handler: mux,
+	}
+
+	go func() {
+		if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
+			t.Logf("Prometheus HTTP server error: %v", err)
+		}
+	}()
+
+	// Wait for server to be ready
+	waitForHTTPEndpoint(t, ctx, fmt.Sprintf("http://localhost:%d/-/ready", port))
+
+	cleanup := func() {
+		server.Shutdown(context.Background())
+		promDB.Close()
+	}
+
+	return promDB, cleanup
+}
+
+// writePrometheusTestData writes test metrics to Prometheus TSDB
+func writePrometheusTestData(t *testing.T, db *tsdb.DB) {
+	t.Helper()
+
+	app := db.Appender(context.Background())
+
+	// Create "up" metric that Prometheus normally exports
+	lbls := labels.FromStrings("__name__", "up", "job", "prometheus", "instance", "localhost:9090")
+
+	// Write samples over the last 5 minutes
+	now := time.Now()
+	for i := 0; i < 20; i++ {
+		ts := now.Add(-5*time.Minute + time.Duration(i)*15*time.Second).UnixMilli()
+		_, err := app.Append(0, lbls, ts, 1.0)
+		require.NoError(t, err)
+	}
+
+	require.NoError(t, app.Commit())
+}
+
 func buildThanosBinary(t *testing.T, tmpDir string) string {
 	t.Helper()
 
@@ -165,49 +324,6 @@ func buildThanosBinary(t *testing.T, tmpDir string) string {
 	require.NoError(t, cmd.Run(), "failed to build Thanos binary")
 
 	return binaryPath
-}
-
-func createPrometheusConfig(t *testing.T, tmpDir string) string {
-	t.Helper()
-
-	config := `global:
-  scrape_interval: 5s
-  external_labels:
-    prometheus: prom1
-    replica: "0"
-
-scrape_configs:
-  - job_name: 'prometheus'
-    static_configs:
-      - targets: ['localhost:9090']
-`
-
-	configPath := filepath.Join(tmpDir, "prometheus.yml")
-	require.NoError(t, os.WriteFile(configPath, []byte(config), 0644))
-
-	return configPath
-}
-
-func startPrometheus(t *testing.T, ctx context.Context, tmpDir, configPath string, port int) *exec.Cmd {
-	t.Helper()
-
-	dataDir := filepath.Join(tmpDir, "prometheus-data")
-	require.NoError(t, os.MkdirAll(dataDir, 0755))
-
-	cmd := exec.CommandContext(ctx, "prometheus",
-		"--config.file="+configPath,
-		"--storage.tsdb.path="+dataDir,
-		fmt.Sprintf("--web.listen-address=:%d", port),
-		"--storage.tsdb.min-block-duration=2h",
-		"--storage.tsdb.max-block-duration=2h",
-	)
-
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-
-	require.NoError(t, cmd.Start())
-
-	return cmd
 }
 
 func createTracingConfig(collectorAddr string) string {
@@ -265,23 +381,17 @@ func startThanosQuery(t *testing.T, ctx context.Context, binary string, sidecarG
 	return cmd
 }
 
-func waitForPrometheus(t *testing.T, ctx context.Context, port int) {
-	t.Helper()
-
-	url := fmt.Sprintf("http://localhost:%d/-/ready", port)
-	waitForEndpoint(t, ctx, url, 30*time.Second)
-}
-
 func waitForThanos(t *testing.T, ctx context.Context, port int) {
 	t.Helper()
 
 	url := fmt.Sprintf("http://localhost:%d/-/ready", port)
-	waitForEndpoint(t, ctx, url, 30*time.Second)
+	waitForHTTPEndpoint(t, ctx, url)
 }
 
-func waitForEndpoint(t *testing.T, ctx context.Context, url string, timeout time.Duration) {
+func waitForHTTPEndpoint(t *testing.T, ctx context.Context, url string) {
 	t.Helper()
 
+	timeout := 30 * time.Second
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		req, err := http.NewRequestWithContext(ctx, "GET", url, nil)

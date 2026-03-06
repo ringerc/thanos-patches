@@ -7,26 +7,18 @@ This integration test validates that Thanos components correctly emit distribute
 ## Key Features
 
 ✅ **Embedded OTLP Server** - Runs a lightweight OTLP gRPC server in-process to collect traces
+✅ **Embedded Prometheus** - Runs Prometheus TSDB and PromQL engine in-process
 ✅ **Automatic Binary Building** - Builds Thanos from source for each test run
 ✅ **Full Stack Testing** - Tests Prometheus → Sidecar → Query chain
 ✅ **Programmatic Validation** - Validates trace attributes directly in Go code
-✅ **No External Dependencies** - Uses minimal OTLP protobuf definitions without full collector framework
+✅ **No External Dependencies** - All components embedded in the test process
 
 ## Running the Tests
 
 ### Prerequisites
 
-Install Prometheus (required for test setup):
-
-```bash
-# macOS
-brew install prometheus
-
-# Linux
-wget https://github.com/prometheus/prometheus/releases/download/v2.45.0/prometheus-2.45.0.linux-amd64.tar.gz
-tar xzf prometheus-2.45.0.linux-amd64.tar.gz
-sudo mv prometheus-2.45.0.linux-amd64/prometheus /usr/local/bin/
-```
+- **Go 1.23 or later**
+- **No external dependencies** - Prometheus and OTLP collector are embedded in the test
 
 ### Run the Test
 
@@ -42,12 +34,13 @@ go test -v -timeout 10m ./...
 
 ### What the Test Does
 
-1. **Starts an embedded OTLP collector** on localhost:14317 (gRPC) and localhost:14318 (HTTP)
+1. **Starts an embedded OTLP server** on localhost:14317 to collect traces
 2. **Builds Thanos binary** from the repository source code
-3. **Starts Prometheus** and configures it to scrape itself
-4. **Starts Thanos Sidecar** configured to send OTLP traces to the collector
-5. **Starts Thanos Query** configured to send OTLP traces to the collector
-6. **Executes test queries** (instant and range queries)
+3. **Starts embedded Prometheus** with TSDB storage and PromQL engine on localhost:9090
+4. **Writes test data** to the Prometheus TSDB (up metric with historical samples)
+5. **Starts Thanos Sidecar** configured to send OTLP traces to the collector
+6. **Starts Thanos Query** configured to send OTLP traces to the collector
+7. **Executes test queries** (instant and range queries)
 7. **Validates trace attributes** are present in collected spans
 
 ### Expected Output
@@ -115,15 +108,6 @@ cd /path/to/thanos/test/integration/otel
 ls ../../../cmd/thanos  # Should exist
 ```
 
-### Prometheus Not Found
-
-**Error**: `exec: "prometheus": executable file not found in $PATH`
-
-**Solution**: Install Prometheus or add it to PATH:
-```bash
-export PATH=$PATH:/path/to/prometheus
-```
-
 ### Port Already in Use
 
 **Error**: `bind: address already in use`
@@ -153,28 +137,34 @@ kill $(lsof -t -i :9090 -i :14317 -i :19090 -i :19190)
 │         Test Process (Go)               │
 │                                         │
 │  ┌──────────────────────────────────┐  │
-│  │  Embedded OTLP Collector         │  │
+│  │  Embedded OTLP Server            │  │
 │  │  - gRPC: localhost:14317         │  │
-│  │  - HTTP: localhost:14318         │  │
 │  │  - Stores traces in memory       │  │
 │  └──────────────────────────────────┘  │
+│                                         │
+│  ┌──────────────────────────────────┐  │
+│  │  Embedded Prometheus             │  │
+│  │  - TSDB Storage                  │  │
+│  │  - PromQL Engine                 │  │
+│  │  - HTTP API: localhost:9090      │  │
+│  └──────────────────────────────────┘  │
 └─────────────────────────────────────────┘
-                   ▲
-                   │ OTLP Traces
-                   │
-        ┌──────────┴──────────┐
-        │                     │
-┌───────▼──────┐    ┌─────────▼──────┐
-│   Sidecar    │    │     Query      │
-│   :19090     │◄───┤     :19192     │
+                   ▲                   ▲
+                   │ OTLP Traces       │ HTTP Query
+        ┌──────────┴──────────┐        │
+        │                     │        │
+┌───────▼──────┐    ┌─────────▼──────┐ │
+│   Sidecar    │    │     Query      │ │
+│   :19090     │◄───┤     :19192     ├─┘
 └──────▲───────┘    └────────────────┘
        │                     ▲
-       │                     │ HTTP Query
-       │                     │
-┌──────▼───────┐    ┌────────▼────────┐
-│  Prometheus  │    │      Test       │
-│    :9090     │    │   (HTTP Client) │
-└──────────────┘    └─────────────────┘
+       │ Store API           │ HTTP Query
+       └─────────────────────┤
+                             │
+                    ┌────────▼────────┐
+                    │      Test       │
+                    │   (HTTP Client) │
+                    └─────────────────┘
 ```
 
 ## Next Steps
