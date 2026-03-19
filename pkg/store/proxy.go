@@ -298,7 +298,8 @@ func (s *ProxyStore) Series(originalRequest *storepb.SeriesRequest, seriesSrv st
 	// or as a result of a grpc call in layered queries
 	ctx := srv.Context()
 
-	if span := opentracing.SpanFromContext(ctx); span != nil {
+	span := opentracing.SpanFromContext(ctx)
+	if span != nil {
 		span.SetTag("series.selector", storepb.MatchersToString(originalRequest.Matchers...))
 	}
 
@@ -362,7 +363,7 @@ func (s *ProxyStore) Series(originalRequest *storepb.SeriesRequest, seriesSrv st
 		respHeap = NewResponseDeduplicator(respHeap)
 	}
 
-	var numSeries, numChunks int64
+	var numSeries, numChunks, estimatedBytes int64
 	i := 0
 	for respHeap.Next() {
 		i++
@@ -378,6 +379,10 @@ func (s *ProxyStore) Series(originalRequest *storepb.SeriesRequest, seriesSrv st
 		if series := resp.GetSeries(); series != nil {
 			numSeries++
 			numChunks += int64(len(series.Chunks))
+			if span != nil {
+				estimatedBytes += estimateZLabelsMemory(series.Labels)
+				estimatedBytes += estimateChunksMemory(series.Chunks)
+			}
 		}
 
 		if err := srv.Send(resp); err != nil {
@@ -386,9 +391,10 @@ func (s *ProxyStore) Series(originalRequest *storepb.SeriesRequest, seriesSrv st
 		}
 	}
 
-	if span := opentracing.SpanFromContext(ctx); span != nil {
+	if span != nil {
 		span.SetTag("result.series", numSeries)
 		span.SetTag("result.samples", numChunks)
+		span.SetTag("result.estimated_bytes", estimatedBytes)
 	}
 
 	// Flush any remaining buffered series from the batchable server.

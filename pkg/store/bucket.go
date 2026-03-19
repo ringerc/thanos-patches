@@ -1585,7 +1585,8 @@ func (s *BucketStore) Series(req *storepb.SeriesRequest, seriesSrv storepb.Store
 
 	tenant, _ := tenancy.GetTenantFromGRPCMetadata(srv.Context())
 
-	if span := opentracing.SpanFromContext(srv.Context()); span != nil {
+	span := opentracing.SpanFromContext(srv.Context())
+	if span != nil {
 		span.SetTag("series.selector", storepb.MatchersToString(req.Matchers...))
 	}
 
@@ -1811,6 +1812,7 @@ func (s *BucketStore) Series(req *storepb.SeriesRequest, seriesSrv storepb.Store
 	lt := NewProxyResponseLoserTree(respSets...)
 	defer lt.Close()
 	// Merge the sub-results from each selected block.
+	var estimatedBytes int64
 	tracing.DoInSpan(ctx, "bucket_store_merge_all", func(ctx context.Context) {
 		begin := time.Now()
 		set := NewResponseDeduplicator(lt)
@@ -1833,9 +1835,17 @@ func (s *BucketStore) Series(req *storepb.SeriesRequest, seriesSrv storepb.Store
 			series := at.GetSeries()
 			if series != nil {
 				stats.mergedSeriesCount++
+				if span != nil {
+					estimatedBytes += estimateZLabelsMemory(series.Labels)
+				}
 				if !req.SkipChunks {
+					chunkBytes := chunksSize(series.Chunks)
 					stats.mergedChunksCount += len(series.Chunks)
-					s.metrics.chunkSizeBytes.WithLabelValues(tenant).Observe(float64(chunksSize(series.Chunks)))
+					// Estimate in-memory size, not protobuf serialization size
+					if span != nil {
+						estimatedBytes += estimateChunksMemory(series.Chunks)
+					}
+					s.metrics.chunkSizeBytes.WithLabelValues(tenant).Observe(float64(chunkBytes))
 				}
 			}
 			if err = srv.Send(at); err != nil {
@@ -1873,9 +1883,10 @@ func (s *BucketStore) Series(req *storepb.SeriesRequest, seriesSrv storepb.Store
 		return err
 	}
 
-	if span := opentracing.SpanFromContext(ctx); span != nil {
+	if span != nil {
 		span.SetTag("result.series", stats.mergedSeriesCount)
 		span.SetTag("result.samples", stats.mergedChunksCount)
+		span.SetTag("result.estimated_bytes", estimatedBytes)
 	}
 
 	return srv.Flush()
@@ -1885,6 +1896,53 @@ func chunksSize(chks []storepb.AggrChunk) (size int) {
 	for _, chk := range chks {
 		size += chk.Size() // This gets the encoded proto size.
 	}
+	return size
+}
+
+// estimateZLabelsMemory estimates memory usage of a ZLabel slice.
+func estimateZLabelsMemory(labels []labelpb.ZLabel) int64 {
+	var size int64
+	for _, lbl := range labels {
+		size += int64(len(lbl.Name) + len(lbl.Value))
+	}
+	return size
+}
+
+// estimateChunksMemory estimates in-memory size of chunks (not protobuf size).
+func estimateChunksMemory(chunks []storepb.AggrChunk) int64 {
+	var size int64
+	for _, chunk := range chunks {
+		size += estimateChunkMemory(chunk)
+	}
+	return size
+}
+
+// estimateChunkMemory estimates in-memory size of a single chunk.
+func estimateChunkMemory(chunk storepb.AggrChunk) int64 {
+	// Struct overhead: MinTime + MaxTime + pointers
+	size := int64(56) // 16 (times) + 40 (struct overhead and pointers)
+
+	// Add size of actual chunk data
+	if chunk.Raw != nil {
+		size += int64(16 + len(chunk.Raw.Data)) // chunk struct overhead + data
+	}
+	// Downsampled chunks (for aggregated data)
+	if chunk.Count != nil {
+		size += int64(16 + len(chunk.Count.Data))
+	}
+	if chunk.Sum != nil {
+		size += int64(16 + len(chunk.Sum.Data))
+	}
+	if chunk.Min != nil {
+		size += int64(16 + len(chunk.Min.Data))
+	}
+	if chunk.Max != nil {
+		size += int64(16 + len(chunk.Max.Data))
+	}
+	if chunk.Counter != nil {
+		size += int64(16 + len(chunk.Counter.Data))
+	}
+
 	return size
 }
 

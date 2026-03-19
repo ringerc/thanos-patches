@@ -128,7 +128,8 @@ func (p *PrometheusStore) Series(r *storepb.SeriesRequest, seriesSrv storepb.Sto
 		newBatchableServer(seriesSrv, int(r.ResponseBatchSize)),
 		sortingStrategyStore)
 
-	if span := opentracing.SpanFromContext(s.Context()); span != nil {
+	span := opentracing.SpanFromContext(s.Context())
+	if span != nil {
 		span.SetTag("series.selector", storepb.MatchersToString(r.Matchers...))
 	}
 
@@ -163,11 +164,14 @@ func (p *PrometheusStore) Series(r *storepb.SeriesRequest, seriesSrv storepb.Sto
 			return err
 		}
 		var b labels.Builder
-		var numSeries int64
+		var numSeries, estimatedBytes int64
 		for _, lbm := range labelMaps {
 			b.Reset(labels.EmptyLabels())
 			for k, v := range lbm {
 				b.Set(k, v)
+				if span != nil {
+					estimatedBytes += int64(len(k) + len(v))
+				}
 			}
 			// external labels should take precedence
 			finalExtLset.Range(func(l labels.Label) {
@@ -179,9 +183,10 @@ func (p *PrometheusStore) Series(r *storepb.SeriesRequest, seriesSrv storepb.Sto
 			}
 			numSeries++
 		}
-		if span := opentracing.SpanFromContext(s.Context()); span != nil {
+		if span != nil {
 			span.SetTag("result.series", numSeries)
 			span.SetTag("result.samples", int64(0))
+			span.SetTag("result.estimated_bytes", estimatedBytes)
 		}
 		return s.Flush()
 	}
@@ -250,12 +255,18 @@ func (p *PrometheusStore) handleSampledPrometheusResponse(
 	defer span.Finish()
 	span.SetTag("series_count", len(resp.Results[0].Timeseries))
 
-	var numSeries, numChunks int64
+	var numSeries, numChunks, estimatedBytes int64
 	for _, e := range resp.Results[0].Timeseries {
 		// https://github.com/prometheus/prometheus/blob/3f6f5d3357e232abe53f1775f893fdf8f842712c/storage/remote/read_handler.go#L166
 		// MergeLabels() prefers local labels over external labels but we prefer
 		// external labels hence we need to do this:
 		lset := rmLabels(labelpb.ExtendSortedLabels(labelpb.ZLabelsToPromLabels(e.Labels), extLset), extLsetToRemove)
+		// Estimate label memory
+		if span != nil {
+			lset.Range(func(l labels.Label) {
+				estimatedBytes += int64(len(l.Name) + len(l.Value))
+			})
+		}
 		if len(e.Samples) == 0 {
 			// As found in https://github.com/thanos-io/thanos/issues/381
 			// Prometheus can give us completely empty time series. Ignore these with log until we figure out that
@@ -276,6 +287,9 @@ func (p *PrometheusStore) handleSampledPrometheusResponse(
 
 		numSeries++
 		numChunks += int64(len(aggregatedChunks))
+		if span != nil {
+			estimatedBytes += estimateChunksMemory(aggregatedChunks)
+		}
 		if err := s.Send(storepb.NewSeriesResponse(&storepb.Series{
 			Labels: labelpb.ZLabelsFromPromLabels(lset),
 			Chunks: aggregatedChunks,
@@ -285,9 +299,10 @@ func (p *PrometheusStore) handleSampledPrometheusResponse(
 	}
 	level.Debug(p.logger).Log("msg", "handled ReadRequest_SAMPLED request.", "series", len(resp.Results[0].Timeseries))
 
-	if span := opentracing.SpanFromContext(s.Context()); span != nil {
+	if span != nil {
 		span.SetTag("result.series", numSeries)
 		span.SetTag("result.samples", numChunks)
+		span.SetTag("result.estimated_bytes", estimatedBytes)
 	}
 
 	return s.Flush()
@@ -318,6 +333,8 @@ func (p *PrometheusStore) handleStreamedPrometheusResponse(
 
 	bodySizer := NewBytesRead(httpResp.Body)
 	seriesStats := &storepb.SeriesStatsCounter{}
+	var estimatedBytes int64
+	span := opentracing.SpanFromContext(s.Context())
 
 	// TODO(bwplotka): Put read limit as a flag.
 	stream := remote.NewChunkedReader(bodySizer, config.DefaultChunkedReadLimit, *data)
@@ -347,6 +364,13 @@ func (p *PrometheusStore) handleStreamedPrometheusResponse(
 				continue
 			}
 
+			// Estimate label memory
+			if span != nil {
+				completeLabelset.Range(func(l labels.Label) {
+					estimatedBytes += int64(len(l.Name) + len(l.Value))
+				})
+			}
+
 			seriesStats.CountSeries(series.Labels)
 			thanosChks := make([]storepb.AggrChunk, len(series.Chunks))
 
@@ -363,6 +387,9 @@ func (p *PrometheusStore) handleStreamedPrometheusResponse(
 						Type: storepb.Chunk_Encoding(chk.Type - 1),
 						Hash: chkHash,
 					},
+				}
+				if span != nil {
+					estimatedBytes += estimateChunkMemory(thanosChks[i])
 				}
 				seriesStats.Samples += thanosChks[i].Raw.XORNumSamples()
 				seriesStats.Chunks++
@@ -387,9 +414,10 @@ func (p *PrometheusStore) handleStreamedPrometheusResponse(
 	querySpan.SetTag("processed.bytes", bodySizer.BytesCount())
 	level.Debug(p.logger).Log("msg", "handled ReadRequest_STREAMED_XOR_CHUNKS request.", "frames", framesNum)
 
-	if span := opentracing.SpanFromContext(s.Context()); span != nil {
+	if span != nil {
 		span.SetTag("result.series", int64(seriesStats.Series))
 		span.SetTag("result.samples", int64(seriesStats.Chunks))
+		span.SetTag("result.estimated_bytes", estimatedBytes)
 	}
 
 	return s.Flush()
